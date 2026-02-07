@@ -413,4 +413,127 @@ function requireManagerOrDirector(req, res, next) {
   if (!tid) return res.status(400).json({ error: 'telegram_id required' });
 
   db.get(`SELECT role FROM users WHERE telegram_id=?`, [tid], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message 
+    if (err) return res.status(500).json({ error: err.message });
+    if (!row || !['manager', 'director'].includes(row.role)) {
+      return res.status(403).json({ error: 'only manager or director' });
+    }
+    req.manager_tid = tid;
+    next();
+  });
+}
+
+app.get('/api/me', (req, res) => {
+  const telegram_id = req.query.telegram_id?.toString();
+  if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
+
+  db.get(`SELECT role, name FROM users WHERE telegram_id=?`, [telegram_id], (err, row) => {
+    if (err) return res.status(500).json({ error: err.message });
+    if (!row) return res.status(404).json({ error: 'not registered' });
+    res.json(row);
+  });
+});
+
+// manager/director: list orders by status (only own created orders)
+app.get('/api/orders', requireManagerOrDirector, async (req, res) => {
+  const status = (req.query.status || 'all').toString();
+  const orders = await listOrdersForManager(req.manager_tid, status, 200).catch(() => null);
+  if (!orders) return res.status(500).json({ error: 'db error' });
+  res.json(orders);
+});
+
+// manager/director: create order
+app.post('/api/orders', requireManagerOrDirector, (req, res) => {
+  const { product, color, quantity, deadline } = req.body || {};
+  if (!product || !color || !quantity) return res.status(400).json({ error: 'product, color, quantity required' });
+
+  db.run(
+    `INSERT INTO orders (manager_tid, product, color, quantity, deadline) VALUES (?, ?, ?, ?, ?)`,
+    [req.manager_tid, product, color, Number(quantity), deadline || null],
+    async function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+
+      const orderId = this.lastID;
+      const workers = await getWorkers();
+
+      for (const w of workers) {
+        await bot.sendMessage(
+          w.telegram_id,
+          `🔔 Новый заказ #${orderId}\nПродукт: ${product}\nЦвет: ${color}\nКол-во: ${quantity} л`,
+          { reply_markup: { inline_keyboard: [[{ text: '✅ Взять', callback_data: `take:${orderId}` }]] } }
+        );
+      }
+
+      res.json({ success: true, id: orderId });
+    }
+  );
+});
+
+app.post('/api/orders/:id/archive', requireManagerOrDirector, (req, res) => {
+  const id = Number(req.params.id);
+  db.run(
+    `UPDATE orders SET status='archived', archived_at=? WHERE id=? AND status='completed' AND manager_tid=?`,
+    [nowIso(), id, req.manager_tid],
+    function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+      if (this.changes === 0) return res.status(400).json({ error: 'cannot archive' });
+      res.json({ success: true });
+    }
+  );
+});
+
+app.post('/api/orders/:id/unarchive', requireManagerOrDirector, (req, res) => {
+  const id = Number(req.params.id);
+  db.run(
+    `UPDATE orders SET status='completed', archived_at=NULL WHERE id=? AND status='archived' AND manager_tid=?`,
+    [id, req.manager_tid],
+    function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+      if (this.changes === 0) return res.status(400).json({ error: 'cannot unarchive' });
+      res.json({ success: true });
+    }
+  );
+});
+
+app.post('/api/orders/:id/cancel', requireManagerOrDirector, (req, res) => {
+  const id = Number(req.params.id);
+  const reason = (req.body.reason || '').toString().slice(0, 500);
+
+  db.run(
+    `UPDATE orders SET status='canceled', canceled_at=?, cancel_reason=?
+     WHERE id=? AND manager_tid=? AND status != 'canceled'`,
+    [nowIso(), reason, id, req.manager_tid],
+    function (err) {
+      if (err) return res.status(500).json({ error: err.message });
+      if (this.changes === 0) return res.status(400).json({ error: 'cannot cancel' });
+      res.json({ success: true });
+    }
+  );
+});
+
+// worker: view orders (all/mine, with status filter)
+app.get('/api/worker/orders', async (req, res) => {
+  const tid = (req.query.telegram_id || '').toString();
+  const scope = (req.query.scope || 'all').toString();
+  const status = (req.query.status || 'all').toString();
+
+  const user = await getUser(tid).catch(() => null);
+  if (!user || user.role !== 'worker') return res.status(403).json({ error: 'only worker' });
+
+  const orders = await listOrdersForWorker(tid, scope, status, 200).catch(() => null);
+  if (!orders) return res.status(500).json({ error: 'db error' });
+  res.json(orders);
+});
+
+// ---- start server + set webhook ----
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, async () => {
+  console.log(`✅ Server listening on port ${PORT}`);
+  const webhookUrl = `${PUBLIC_URL}${WEBHOOK_PATH}`;
+  try {
+    await bot.setWebHook(webhookUrl);
+    console.log('✅ Webhook set to:', webhookUrl);
+  } catch (e) {
+    console.error('❌ setWebHook error:', e.message);
+  }
+});
