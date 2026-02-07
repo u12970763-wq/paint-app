@@ -4,100 +4,93 @@ tg.expand();
 
 const user = tg.initDataUnsafe?.user;
 if (!user?.id) { tg.showAlert('Нет Telegram ID'); throw new Error('No user'); }
-const telegramId = user.id.toString();
+const tid = user.id.toString();
 
-const elManager = document.getElementById('manager');
-const elNot = document.getElementById('not-manager');
+const elApp = document.getElementById('app');
+const elNo = document.getElementById('noaccess');
 const elList = document.getElementById('list');
 
-let currentStatus = 'new';
+let mode = 'urgent';
 
 async function api(url, options) {
   const res = await fetch(url, options);
-  const data = await res.json().catch(() => ({}));
+  const data = await res.json().catch(()=> ({}));
   if (!res.ok) throw new Error(data.error || 'API error');
   return data;
 }
 
-function statusText(s) {
-  return ({
-    new: 'Новые',
-    in_progress: 'В работе',
-    completed: 'Готово',
-    archived: 'Архив',
-    canceled: 'Отменено'
-  })[s] || s;
+function badgeClass(status){
+  return ({ new:'b-new', in_progress:'b-progress', completed:'b-done', archived:'b-arch' })[status] || 'b-new';
+}
+function statusRu(status){
+  return ({new:'Новые',in_progress:'В работе',completed:'Готово',archived:'Архив'})[status] || status;
 }
 
-function badgeClass(s) {
-  return ({
-    new: 'b-new',
-    in_progress: 'b-progress',
-    completed: 'b-done',
-    archived: 'b-arch',
-    canceled: 'b-cancel'
-  })[s] || 'b-new';
+function esc(s){ return String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
+
+function itemsHtml(items){
+  if (!items?.length) return '';
+  const lines = items.slice(0,3).map(it => `<div class="li">• ${esc(it.product)} <span class="dim">|</span> ${esc(it.color)} <span class="dim">|</span> <b>${it.quantity}</b> кг</div>`).join('');
+  const more = items.length > 3 ? `<div class="dim">ещё ${items.length-3}...</div>` : '';
+  return `<div class="items">${lines}${more}</div>`;
 }
 
-function formatDate(iso) {
-  try { return new Date(iso).toLocaleString(); } catch { return ''; }
-}
+async function load(){
+  let url;
+  if (mode === 'urgent') url = `/api/orders?telegram_id=${tid}&urgent=1&status=all`;
+  else url = `/api/orders?telegram_id=${tid}&status=${encodeURIComponent(mode)}`;
 
-async function loadOrders() {
-  const orders = await api(`/api/orders?telegram_id=${telegramId}&status=${encodeURIComponent(currentStatus)}`);
+  const orders = await api(url);
   render(orders);
 }
 
-function render(orders) {
+function render(orders){
   elList.innerHTML = orders.length ? '' : `<div class="card muted">Пусто</div>`;
 
-  for (const o of orders) {
+  for (const o of orders){
+    const urgent = o.urgent ? `<span class="pill pill-urgent">🔥 Срочно</span>` : '';
+    const worker = o.worker_name ? `<span class="pill pill-worker">👷 ${esc(o.worker_name)}</span>` : '';
+    const deadline = o.deadline ? `<span class="pill pill-deadline">⏱ ${new Date(o.deadline).toLocaleString()}</span>` : '';
+
     const card = document.createElement('div');
     card.className = 'card order';
 
     card.innerHTML = `
       <div class="row">
-        <div class="order-title">#${o.id} — ${o.product}</div>
-        <span class="badge ${badgeClass(o.status)}">${statusText(o.status)}</span>
+        <div class="order-title">#${o.id}</div>
+        <span class="badge ${badgeClass(o.status)}">${statusRu(o.status)}</span>
       </div>
 
-      <div class="grid">
-        <div><span class="k">Цвет:</span> ${o.color}</div>
-        <div><span class="k">Кол-во:</span> ${o.quantity} л</div>
-        ${o.deadline ? `<div><span class="k">Срок:</span> ${formatDate(o.deadline)}</div>` : ''}
-        <div><span class="k">Создана:</span> ${formatDate(o.created_at)}</div>
-        ${o.worker_name ? `<div><span class="k">Рабочий:</span> ${o.worker_name}</div>` : (o.worker_tid ? `<div><span class="k">Рабочий:</span> ${o.worker_tid}</div>` : '')}
-        ${o.cancel_reason ? `<div class="full"><span class="k">Причина отмены:</span> ${o.cancel_reason}</div>` : ''}
-      </div>
-
-      <div class="actions" id="actions-${o.id}"></div>
+      <div class="pills">${urgent}${worker}${deadline}</div>
+      ${itemsHtml(o.items)}
+      <div class="actions" id="a-${o.id}"></div>
     `;
 
-    const actions = card.querySelector(`#actions-${o.id}`);
+    const a = card.querySelector(`#a-${o.id}`);
 
-    if (o.status === 'completed') {
-      actions.appendChild(btn('🗂 В архив', async () => {
-        await api(`/api/orders/${o.id}/archive?telegram_id=${telegramId}`, { method: 'POST' });
-        await loadOrders();
+    if (o.status === 'completed'){
+      a.appendChild(btn('🗂 В архив', async ()=>{
+        await api(`/api/orders/${o.id}/archive?telegram_id=${tid}`, {method:'POST'});
+        await load();
       }, 'btn'));
     }
 
-    if (o.status === 'archived') {
-      actions.appendChild(btn('↩ Вернуть', async () => {
-        await api(`/api/orders/${o.id}/unarchive?telegram_id=${telegramId}`, { method: 'POST' });
-        await loadOrders();
+    if (o.status === 'archived'){
+      a.appendChild(btn('↩ Вернуть', async ()=>{
+        await api(`/api/orders/${o.id}/unarchive?telegram_id=${tid}`, {method:'POST'});
+        await load();
       }, 'btn'));
     }
 
-    if (o.status !== 'canceled') {
-      actions.appendChild(btn('✖ Отменить', async () => {
+    if (o.status !== 'archived'){
+      a.appendChild(btn('✖ Отменить', async ()=>{
         const reason = prompt('Причина отмены (необязательно):') || '';
-        await api(`/api/orders/${o.id}/cancel?telegram_id=${telegramId}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ reason })
+        await api(`/api/orders/${o.id}/cancel?telegram_id=${tid}`, {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({reason})
         });
-        await loadOrders();
+        await load();
       }, 'btn btn-danger'));
     }
 
@@ -105,37 +98,36 @@ function render(orders) {
   }
 }
 
-function btn(text, onClick, cls) {
-  const b = document.createElement('button');
-  b.className = cls;
-  b.textContent = text;
-  b.onclick = (e) => { e.preventDefault(); onClick(); };
+function btn(text, onClick, cls){
+  const b=document.createElement('button');
+  b.className=cls;
+  b.textContent=text;
+  b.onclick=(e)=>{e.preventDefault(); onClick();};
   return b;
 }
 
-async function init() {
-  try {
-    const me = await api(`/api/me?telegram_id=${telegramId}`);
-    if (!['manager','director'].includes(me.role)) {
-      elNot.classList.remove('hidden');
+async function init(){
+  try{
+    const me = await api(`/api/me?telegram_id=${tid}`);
+    if (!['manager','director'].includes(me.role)){
+      elNo.classList.remove('hidden');
       return;
     }
+    elApp.classList.remove('hidden');
 
-    elManager.classList.remove('hidden');
-
-    document.querySelectorAll('.tab').forEach(t => {
-      t.onclick = async () => {
-        document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.tab').forEach(t=>{
+      t.onclick=async ()=>{
+        document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
         t.classList.add('active');
-        currentStatus = t.dataset.status;
-        await loadOrders();
+        mode = t.dataset.mode;
+        await load();
       };
     });
 
-    await loadOrders();
-    setInterval(loadOrders, 10000);
-  } catch {
-    elNot.classList.remove('hidden');
+    await load();
+    setInterval(load, 10000);
+  }catch{
+    elNo.classList.remove('hidden');
   }
 }
 
