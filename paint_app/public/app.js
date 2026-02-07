@@ -10,6 +10,8 @@ const elManager = document.getElementById('manager');
 const elNot = document.getElementById('not-manager');
 const elList = document.getElementById('list');
 
+let currentStatus = 'new';
+
 async function api(url, options) {
   const res = await fetch(url, options);
   const data = await res.json().catch(() => ({}));
@@ -18,67 +20,121 @@ async function api(url, options) {
 }
 
 function statusText(s) {
-  if (s === 'new') return 'Новый';
-  if (s === 'in_progress') return 'В работе';
-  if (s === 'completed') return 'Готово';
-  return s;
+  return ({
+    new: 'Новые',
+    in_progress: 'В работе',
+    completed: 'Готово',
+    archived: 'Архив',
+    canceled: 'Отменено'
+  })[s] || s;
+}
+
+function badgeClass(s) {
+  return ({
+    new: 'b-new',
+    in_progress: 'b-progress',
+    completed: 'b-done',
+    archived: 'b-arch',
+    canceled: 'b-cancel'
+  })[s] || 'b-new';
+}
+
+function formatDate(iso) {
+  try { return new Date(iso).toLocaleString(); } catch { return ''; }
 }
 
 async function loadOrders() {
-  const orders = await api(`/api/orders?telegram_id=${telegramId}`);
-  elList.innerHTML = orders.length ? '' : '<div>Заказов пока нет.</div>';
+  const orders = await api(`/api/orders?telegram_id=${telegramId}&status=${encodeURIComponent(currentStatus)}`);
+  render(orders);
+}
+
+function render(orders) {
+  elList.innerHTML = orders.length ? '' : `<div class="card muted">Пусто</div>`;
 
   for (const o of orders) {
-    const div = document.createElement('div');
-    div.className = 'item';
-    div.innerHTML = `
-      <div><b>#${o.id}</b> — ${o.product}</div>
-      <div>Цвет: ${o.color}</div>
-      <div>Количество: ${o.quantity} л</div>
-      <div>Статус: <span class="badge ${o.status}">${statusText(o.status)}</span></div>
-      ${o.deadline ? `<div>Срок: ${new Date(o.deadline).toLocaleString()}</div>` : ''}
-      ${o.worker_tid ? `<div>Рабочий TG ID: ${o.worker_tid}</div>` : ''}
+    const card = document.createElement('div');
+    card.className = 'card order';
+
+    card.innerHTML = `
+      <div class="row">
+        <div class="order-title">#${o.id} — ${o.product}</div>
+        <span class="badge ${badgeClass(o.status)}">${statusText(o.status)}</span>
+      </div>
+
+      <div class="grid">
+        <div><span class="k">Цвет:</span> ${o.color}</div>
+        <div><span class="k">Кол-во:</span> ${o.quantity} л</div>
+        ${o.deadline ? `<div><span class="k">Срок:</span> ${formatDate(o.deadline)}</div>` : ''}
+        <div><span class="k">Создана:</span> ${formatDate(o.created_at)}</div>
+        ${o.worker_name ? `<div><span class="k">Рабочий:</span> ${o.worker_name}</div>` : (o.worker_tid ? `<div><span class="k">Рабочий:</span> ${o.worker_tid}</div>` : '')}
+        ${o.cancel_reason ? `<div class="full"><span class="k">Причина отмены:</span> ${o.cancel_reason}</div>` : ''}
+      </div>
+
+      <div class="actions" id="actions-${o.id}"></div>
     `;
-    elList.appendChild(div);
+
+    const actions = card.querySelector(`#actions-${o.id}`);
+
+    if (o.status === 'completed') {
+      actions.appendChild(btn('🗂 В архив', async () => {
+        await api(`/api/orders/${o.id}/archive?telegram_id=${telegramId}`, { method: 'POST' });
+        await loadOrders();
+      }, 'btn'));
+    }
+
+    if (o.status === 'archived') {
+      actions.appendChild(btn('↩ Вернуть', async () => {
+        await api(`/api/orders/${o.id}/unarchive?telegram_id=${telegramId}`, { method: 'POST' });
+        await loadOrders();
+      }, 'btn'));
+    }
+
+    if (o.status !== 'canceled') {
+      actions.appendChild(btn('✖ Отменить', async () => {
+        const reason = prompt('Причина отмены (необязательно):') || '';
+        await api(`/api/orders/${o.id}/cancel?telegram_id=${telegramId}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reason })
+        });
+        await loadOrders();
+      }, 'btn btn-danger'));
+    }
+
+    elList.appendChild(card);
   }
 }
 
-function setupForm() {
-  const form = document.getElementById('form');
-  form.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const product = document.getElementById('product').value.trim();
-    const color = document.getElementById('color').value.trim();
-    const quantity = parseFloat(document.getElementById('quantity').value);
-    const deadline = document.getElementById('deadline').value || null;
-
-    try {
-      await api('/api/orders', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ telegram_id: telegramId, product, color, quantity, deadline })
-      });
-      tg.showAlert('Заказ создан. Рабочие уведомлены.');
-      form.reset();
-      await loadOrders();
-    } catch (err) {
-      tg.showAlert(err.message);
-    }
-  });
+function btn(text, onClick, cls) {
+  const b = document.createElement('button');
+  b.className = cls;
+  b.textContent = text;
+  b.onclick = (e) => { e.preventDefault(); onClick(); };
+  return b;
 }
 
 async function init() {
   try {
     const me = await api(`/api/me?telegram_id=${telegramId}`);
-    if (me.role !== 'manager') {
+    if (!['manager','director'].includes(me.role)) {
       elNot.classList.remove('hidden');
       return;
     }
+
     elManager.classList.remove('hidden');
-    setupForm();
+
+    document.querySelectorAll('.tab').forEach(t => {
+      t.onclick = async () => {
+        document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+        t.classList.add('active');
+        currentStatus = t.dataset.status;
+        await loadOrders();
+      };
+    });
+
     await loadOrders();
-    setInterval(loadOrders, 5000);
-  } catch (e) {
+    setInterval(loadOrders, 10000);
+  } catch {
     elNot.classList.remove('hidden');
   }
 }
