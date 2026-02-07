@@ -7,18 +7,27 @@ const sqlite3 = require('sqlite3').verbose();
 const TelegramBot = require('node-telegram-bot-api');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const PUBLIC_URL = process.env.PUBLIC_URL;
+const PUBLIC_URL = process.env.PUBLIC_URL; // например: https://paint-app-1.onrender.com
 
 if (!BOT_TOKEN) {
-  console.error('❌ Нет BOT_TOKEN в .env / Env Vars');
+  console.error('❌ BOT_TOKEN is missing');
+  process.exit(1);
+}
+if (!PUBLIC_URL) {
+  console.error('❌ PUBLIC_URL is missing (must be https url of your Render service)');
   process.exit(1);
 }
 
 const app = express();
 app.use(cors());
+
+// важно: JSON нужен для webhook
 app.use(express.json());
+
+// раздача мини-аппа
 app.use(express.static(path.join(__dirname, 'public')));
 
+// ---- DB ----
 const db = new sqlite3.Database(path.join(__dirname, 'data.db'));
 
 db.serialize(() => {
@@ -46,9 +55,18 @@ db.serialize(() => {
   `);
 });
 
-// ---- BOT ----
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+// ---- Telegram Bot (WEBHOOK MODE) ----
+const bot = new TelegramBot(BOT_TOKEN); // ВАЖНО: без polling
 
+const WEBHOOK_PATH = '/telegram-webhook';
+
+// Endpoint, куда Telegram будет присылать обновления
+app.post(WEBHOOK_PATH, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
+
+// DB helpers
 function upsertUser(telegramId, role, name) {
   return new Promise((resolve, reject) => {
     db.run(
@@ -70,6 +88,8 @@ function getWorkers() {
   });
 }
 
+// ---- BOT HANDLERS ----
+
 // /start -> кнопки
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(msg.chat.id, 'Выберите роль:', {
@@ -81,12 +101,16 @@ bot.onText(/\/start/, (msg) => {
   });
 });
 
-// Нажатие кнопок Manager/Worker
+// нажатие кнопок Manager/Worker
 bot.on('message', async (msg) => {
   const text = (msg.text || '').trim();
 
+  // Игнорируем /start и прочие команды тут, чтобы не дублировать ответы
+  if (text.startsWith('/')) return;
+
   if (text === '🛒 Manager') {
     await upsertUser(msg.from.id, 'manager', msg.from.first_name);
+
     return bot.sendMessage(msg.chat.id, '✅ Вы менеджер. Откройте mini‑app:', {
       reply_markup: {
         remove_keyboard: true,
@@ -103,14 +127,14 @@ bot.on('message', async (msg) => {
   }
 });
 
-// /open (если надо)
+// /open (на всякий)
 bot.onText(/\/open/, (msg) => {
   bot.sendMessage(msg.chat.id, 'Открыть mini‑app:', {
     reply_markup: { inline_keyboard: [[{ text: '📱 Открыть', web_app: { url: PUBLIC_URL } }]] }
   });
 });
 
-// Кнопки “Взять/Готово”
+// Взять/Готово
 bot.on('callback_query', async (q) => {
   const tid = q.from.id.toString();
   const [action, idStr] = (q.data || '').split(':');
@@ -155,7 +179,7 @@ bot.on('callback_query', async (q) => {
   }
 });
 
-// ---- API ----
+// ---- API for Mini-App ----
 app.get('/api/me', (req, res) => {
   const telegram_id = req.query.telegram_id?.toString();
   if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
@@ -214,5 +238,18 @@ app.get('/api/orders', (req, res) => {
   );
 });
 
+// ---- start server + set webhook ----
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Server listening on port ${PORT}`));
+
+app.listen(PORT, async () => {
+  console.log(`✅ Server listening on port ${PORT}`);
+
+  // Ставим webhook на запуске
+  const webhookUrl = `${PUBLIC_URL}${WEBHOOK_PATH}`;
+  try {
+    await bot.setWebHook(webhookUrl);
+    console.log('✅ Webhook set to:', webhookUrl);
+  } catch (e) {
+    console.error('❌ setWebHook error:', e.message);
+  }
+});
