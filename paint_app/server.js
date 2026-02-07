@@ -19,7 +19,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const db = new sqlite3.Database(path.join(__dirname, 'data.db'));
 
-// ---- DB init + soft migrations ----
+// ---- DB ----
 db.serialize(() => {
   db.run(`
     CREATE TABLE IF NOT EXISTS users (
@@ -72,15 +72,16 @@ db.serialize(() => {
   alter(`ALTER TABLE orders ADD COLUMN cancel_reason TEXT`);
 });
 
-// ---- Telegram Bot (WEBHOOK) ----
-const bot = new TelegramBot(BOT_TOKEN);
-const WEBHOOK_PATH = '/telegram-webhook';
-app.post(WEBHOOK_PATH, (req, res) => { bot.processUpdate(req.body); res.sendStatus(200); });
-
-// ---- Helpers ----
 const ARCHIVE_AFTER_HOURS = 12;
 const ARCHIVE_KEEP_DAYS = 30;
 
+// ---- Telegram Bot (WEBHOOK) ----
+const bot = new TelegramBot(BOT_TOKEN);
+const WEBHOOK_PATH = '/telegram-webhook';
+
+app.post(WEBHOOK_PATH, (req, res) => { bot.processUpdate(req.body); res.sendStatus(200); });
+
+// ---- Helpers ----
 function nowIso() { return new Date().toISOString(); }
 function hoursDiff(a, b) { return (new Date(b).getTime() - new Date(a).getTime()) / 36e5; }
 function daysDiff(a, b) { return (new Date(b).getTime() - new Date(a).getTime()) / (36e5 * 24); }
@@ -137,7 +138,7 @@ function statusRu(s) {
 
 function orderText(o) {
   const urgent = o.urgent ? '🔥 СРОЧНО\n' : '';
-  const items = (o.items || []).map(it => `• ${it.product} | ${it.color} | ${it.quantity} л`).join('\n');
+  const items = (o.items || []).map(it => `• ${it.product} | ${it.color} | ${it.quantity} кг`).join('\n');
   const deadline = o.deadline ? `\n⏱ Срок: ${new Date(o.deadline).toLocaleString()}` : '';
   const worker = o.worker_name ? `\n👷 Рабочий: ${o.worker_name}` : (o.worker_tid ? `\n👷 Рабочий: ${o.worker_tid}` : '');
   return `${urgent}#${o.id} — ${statusRu(o.status)}${deadline}${worker}\n${items}`;
@@ -227,7 +228,8 @@ function workerMenu() {
     reply_markup: {
       keyboard: [
         [{ text: '🔥 Срочно' }, { text: '📋 Новые' }],
-        [{ text: '🧰 Мои' }, { text: '✅ Готово' }]
+        [{ text: '🧰 Мои' }, { text: '✅ Готово' }],
+        [{ text: '📱 Открыть Worker' }]
       ],
       resize_keyboard: true
     }
@@ -259,7 +261,18 @@ bot.on('message', async (msg) => {
 
   if (text === '🛠 Worker') {
     await upsertUser(tid, 'worker', msg.from.first_name);
+
+    await bot.sendMessage(msg.chat.id, '📱 Worker mini‑app:', {
+      reply_markup: { inline_keyboard: [[{ text: 'Открыть Worker', web_app: { url: `${PUBLIC_URL}/worker.html` } }]] }
+    });
+
     return bot.sendMessage(msg.chat.id, '✅ Вы Worker. Меню:', workerMenu());
+  }
+
+  if (text === '📱 Открыть Worker') {
+    return bot.sendMessage(msg.chat.id, '📱 Worker mini‑app:', {
+      reply_markup: { inline_keyboard: [[{ text: 'Открыть Worker', web_app: { url: `${PUBLIC_URL}/worker.html` } }]] }
+    });
   }
 
   // Worker menu actions
@@ -345,7 +358,6 @@ bot.on('callback_query', async (q) => {
       [tid, orderId],
       async function (err) {
         if (err || this.changes === 0) {
-          // someone else took it -> delete for this worker
           await deleteSafe(q.message.chat.id, q.message.message_id);
           return;
         }
@@ -445,7 +457,7 @@ app.get('/api/orders', requireManagerOrDirector, async (req, res) => {
   );
 });
 
-// ---- API: create order (items unlimited + urgent) ----
+// ---- API: create order ----
 app.post('/api/orders', requireManagerOrDirector, async (req, res) => {
   const urgent = req.body?.urgent ? 1 : 0;
   const deadline = req.body?.deadline || null;
@@ -472,7 +484,7 @@ app.post('/api/orders', requireManagerOrDirector, async (req, res) => {
       const orderId = this.lastID;
       const order = await enrichOrder(await getOrder(orderId));
 
-      // notify all workers and store message ids for deletion
+      // notify all workers and store msg ids
       const workers = await getWorkers();
       for (const w of workers) {
         const sent = await bot.sendMessage(
@@ -575,7 +587,7 @@ app.post('/api/worker/take', async (req, res) => {
       for (const n of notes) await deleteSafe(n.chat_id, n.message_id);
       await clearNotifications(orderId, 'new');
 
-      // send chat message to worker with "complete" button and store it
+      // send chat message to worker with complete button
       const order = await enrichOrder(await getOrder(orderId));
       const sent = await bot.sendMessage(tid, orderText(order), workerButtons(order, tid));
       await saveNotification({ order_id: orderId, worker_tid: tid, chat_id: tid, message_id: sent.message_id, type: 'in_progress' });
@@ -600,7 +612,7 @@ app.post('/api/worker/complete', async (req, res) => {
       if (err) return res.status(500).json({ error: err.message });
       if (!this.changes) return res.status(400).json({ error: 'cannot complete' });
 
-      // delete worker's in_progress message(s)
+      // delete in_progress message(s) for this worker
       const notes = await getNotifications(orderId, 'in_progress').catch(() => []);
       for (const n of notes) if (n.worker_tid === tid) await deleteSafe(n.chat_id, n.message_id);
       await clearNotifications(orderId, 'in_progress');
