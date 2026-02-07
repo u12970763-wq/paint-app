@@ -17,10 +17,9 @@ async function api(url, options){
   return data;
 }
 
-function addItemRow(init = {product:'', color:'', quantity:''}){
+function addRow(init = {product:'', color:'', quantity:''}){
   const wrap = document.createElement('div');
   wrap.className = 'item-row';
-
   wrap.innerHTML = `
     <div class="item-grid">
       <div>
@@ -32,7 +31,7 @@ function addItemRow(init = {product:'', color:'', quantity:''}){
         <input class="c" placeholder="RAL 9003" value="${init.color || ''}">
       </div>
       <div>
-        <label>Количество (л)</label>
+        <label>Количество (кг)</label>
         <input class="q" type="number" step="0.1" min="0.1" value="${init.quantity || ''}">
       </div>
     </div>
@@ -40,24 +39,17 @@ function addItemRow(init = {product:'', color:'', quantity:''}){
       <button class="btn btn-danger del">Удалить</button>
     </div>
   `;
-
-  wrap.querySelector('.del').onclick = (e) => {
-    e.preventDefault();
-    wrap.remove();
-  };
-
+  wrap.querySelector('.del').onclick = (e)=>{ e.preventDefault(); wrap.remove(); };
   elItems.appendChild(wrap);
 }
 
 function collectItems(){
   const rows = [...document.querySelectorAll('.item-row')];
-  const items = rows.map(r => ({
+  return rows.map(r => ({
     product: r.querySelector('.p').value.trim(),
     color: r.querySelector('.c').value.trim(),
     quantity: parseFloat(r.querySelector('.q').value)
   })).filter(it => it.product && it.color && Number.isFinite(it.quantity) && it.quantity > 0);
-
-  return items;
 }
 
 async function init(){
@@ -69,22 +61,17 @@ async function init(){
     }
     elApp.classList.remove('hidden');
 
-    // initial 1 row
-    addItemRow();
+    addRow();
 
-    document.getElementById('add').onclick = (e) => {
+    document.getElementById('add').onclick = (e)=>{ e.preventDefault(); addRow(); };
+
+    document.getElementById('submit').onclick = async (e)=>{
       e.preventDefault();
-      addItemRow();
-    };
-
-    document.getElementById('submit').onclick = async (e) => {
-      e.preventDefault();
-
       const urgent = document.getElementById('urgent').checked;
       const deadline = document.getElementById('deadline').value || null;
       const items = collectItems();
 
-      if (!items.length) return tg.showAlert('Добавьте хотя бы одну корректную позицию.');
+      if (!items.length) return tg.showAlert('Добавьте хотя бы одну строку (продукт/цвет/кг).');
 
       try{
         await api(`/api/orders?telegram_id=${tid}`, {
@@ -98,7 +85,6 @@ async function init(){
         tg.showAlert(err.message);
       }
     };
-
   }catch{
     elNo.classList.remove('hidden');
   }
