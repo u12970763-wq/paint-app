@@ -11,29 +11,33 @@
   <div class="wrap">
     <div class="header">
       <div class="title">Создать заявку</div>
-      <a class="btn" href="/">← Назад</a>
+      <a class="btn btn-ghost" href="/">← Назад</a>
     </div>
 
-    <div id="not-manager" class="card hidden">
-      Только Manager/Director может создавать заявки.
-    </div>
+    <div id="noaccess" class="card hidden">Только Manager/Director.</div>
 
-    <div id="manager" class="hidden card">
-      <form id="form">
-        <label>Продукт</label>
-        <input id="product" required placeholder="Festek ... / PlasterSil ..." />
+    <div id="app" class="hidden card">
+      <div class="row between">
+        <div class="muted"><b>Позиции</b> (можно добавлять сколько угодно)</div>
+        <label class="switch">
+          <input id="urgent" type="checkbox">
+          <span class="slider"></span>
+          <span class="switch-label">Срочно</span>
+        </label>
+      </div>
 
-        <label>Цвет</label>
-        <input id="color" required placeholder="Напр. RAL 9003" />
+      <div id="items"></div>
 
-        <label>Количество (л)</label>
-        <input id="quantity" type="number" step="0.1" min="0.1" required />
+      <div class="actions">
+        <button id="add" class="btn">+ Добавить позицию</button>
+      </div>
 
-        <label>Срок (необязательно)</label>
-        <input id="deadline" type="datetime-local" />
+      <label>Срок (необязательно)</label>
+      <input id="deadline" type="datetime-local"/>
 
-        <button class="btn btn-primary" type="submit">Создать</button>
-      </form>
+      <div class="actions">
+        <button id="submit" class="btn btn-primary">Создать заявку</button>
+      </div>
     </div>
   </div>
 
