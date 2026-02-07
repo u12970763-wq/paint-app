@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Worker</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="style.css"/>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <div class="title">Worker</div>
+      <a class="btn btn-ghost" href="/">← Назад</a>
+    </div>
+
+    <div id="noaccess" class="card hidden">Только Worker.</div>
+
+    <div id="app" class="hidden">
+      <div class="tabs">
+        <button class="tab active" data-tab="urgent">🔥 Срочно</button>
+        <button class="tab" data-tab="new">Новые</button>
+        <button class="tab" data-tab="mine">Мои</button>
+        <button class="tab" data-tab="completed">Готово</button>
+      </div>
+
+      <div id="list" class="list"></div>
+      <div class="muted">Автообновление каждые 10 секунд.</div>
+    </div>
+  </div>
+
+  <script src="worker.js"></script>
+</body>
+</html>
