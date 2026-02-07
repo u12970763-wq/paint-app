@@ -25,7 +25,7 @@ function badgeClass(s){ return ({new:'b-new',in_progress:'b-progress',completed:
 
 function itemsHtml(items){
   if (!items?.length) return '';
-  return `<div class="items">${items.map(it => `<div class="li">• ${esc(it.product)} <span class="dim">|</span> ${esc(it.color)} <span class="dim">|</span> <b>${it.quantity}</b> л</div>`).join('')}</div>`;
+  return `<div class="items">${items.map(it => `<div class="li">• ${esc(it.product)} <span class="dim">|</span> ${esc(it.color)} <span class="dim">|</span> <b>${it.quantity}</b> кг</div>`).join('')}</div>`;
 }
 
 async function load(){
@@ -76,9 +76,6 @@ function btn(text, onClick, cls){
 }
 
 async function doTake(orderId){
-  // Берём через бот? Мы делаем простой API? 
-  // Для минимальных изменений используем Telegram callback не можем.
-  // Поэтому сделаем через fetch на специальный endpoint worker action:
   await api(`/api/worker/take`, {
     method:'POST',
     headers:{'Content-Type':'application/json'},
