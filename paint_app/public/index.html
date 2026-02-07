@@ -11,20 +11,21 @@
   <div class="wrap">
     <div class="header">
       <div class="title">Заявки</div>
-      <a class="btn btn-primary" href="/create.html">+ Создать</a>
+      <div class="header-actions">
+        <a class="btn btn-ghost" href="/worker.html">Worker</a>
+        <a class="btn btn-primary" href="/create.html">+ Создать</a>
+      </div>
     </div>
 
-    <div id="not-manager" class="card hidden">
-      Этот раздел доступен только Manager/Director. В боте выберите роль.
-    </div>
+    <div id="noaccess" class="card hidden">Только Manager/Director.</div>
 
-    <div id="manager" class="hidden">
+    <div id="app" class="hidden">
       <div class="tabs">
-        <button class="tab active" data-status="new">Новые</button>
-        <button class="tab" data-status="in_progress">В работе</button>
-        <button class="tab" data-status="completed">Готово</button>
-        <button class="tab" data-status="archived">Архив</button>
-        <button class="tab" data-status="canceled">Отменено</button>
+        <button class="tab active" data-mode="urgent">🔥 Срочно</button>
+        <button class="tab" data-mode="new">Новые</button>
+        <button class="tab" data-mode="in_progress">В работе</button>
+        <button class="tab" data-mode="completed">Готово</button>
+        <button class="tab" data-mode="archived">Архив</button>
       </div>
 
       <div id="list" class="list"></div>
