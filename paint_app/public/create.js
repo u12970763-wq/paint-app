@@ -4,52 +4,103 @@ tg.expand();
 
 const user = tg.initDataUnsafe?.user;
 if (!user?.id) { tg.showAlert('Нет Telegram ID'); throw new Error('No user'); }
-const telegramId = user.id.toString();
+const tid = user.id.toString();
 
-const elManager = document.getElementById('manager');
-const elNot = document.getElementById('not-manager');
+const elApp = document.getElementById('app');
+const elNo = document.getElementById('noaccess');
+const elItems = document.getElementById('items');
 
-async function api(url, options) {
+async function api(url, options){
   const res = await fetch(url, options);
-  const data = await res.json().catch(() => ({}));
+  const data = await res.json().catch(()=> ({}));
   if (!res.ok) throw new Error(data.error || 'API error');
   return data;
 }
 
-async function init() {
-  try {
-    const me = await api(`/api/me?telegram_id=${telegramId}`);
-    if (!['manager','director'].includes(me.role)) {
-      elNot.classList.remove('hidden');
+function addItemRow(init = {product:'', color:'', quantity:''}){
+  const wrap = document.createElement('div');
+  wrap.className = 'item-row';
+
+  wrap.innerHTML = `
+    <div class="item-grid">
+      <div>
+        <label>Продукт</label>
+        <input class="p" placeholder="Festek ... / PlasterSil ..." value="${init.product || ''}">
+      </div>
+      <div>
+        <label>Цвет</label>
+        <input class="c" placeholder="RAL 9003" value="${init.color || ''}">
+      </div>
+      <div>
+        <label>Количество (л)</label>
+        <input class="q" type="number" step="0.1" min="0.1" value="${init.quantity || ''}">
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn btn-danger del">Удалить</button>
+    </div>
+  `;
+
+  wrap.querySelector('.del').onclick = (e) => {
+    e.preventDefault();
+    wrap.remove();
+  };
+
+  elItems.appendChild(wrap);
+}
+
+function collectItems(){
+  const rows = [...document.querySelectorAll('.item-row')];
+  const items = rows.map(r => ({
+    product: r.querySelector('.p').value.trim(),
+    color: r.querySelector('.c').value.trim(),
+    quantity: parseFloat(r.querySelector('.q').value)
+  })).filter(it => it.product && it.color && Number.isFinite(it.quantity) && it.quantity > 0);
+
+  return items;
+}
+
+async function init(){
+  try{
+    const me = await api(`/api/me?telegram_id=${tid}`);
+    if (!['manager','director'].includes(me.role)){
+      elNo.classList.remove('hidden');
       return;
     }
+    elApp.classList.remove('hidden');
 
-    elManager.classList.remove('hidden');
+    // initial 1 row
+    addItemRow();
 
-    document.getElementById('form').addEventListener('submit', async (e) => {
+    document.getElementById('add').onclick = (e) => {
+      e.preventDefault();
+      addItemRow();
+    };
+
+    document.getElementById('submit').onclick = async (e) => {
       e.preventDefault();
 
-      const product = document.getElementById('product').value.trim();
-      const color = document.getElementById('color').value.trim();
-      const quantity = parseFloat(document.getElementById('quantity').value);
+      const urgent = document.getElementById('urgent').checked;
       const deadline = document.getElementById('deadline').value || null;
+      const items = collectItems();
 
-      try {
-        await api(`/api/orders?telegram_id=${telegramId}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ product, color, quantity, deadline })
+      if (!items.length) return tg.showAlert('Добавьте хотя бы одну корректную позицию.');
+
+      try{
+        await api(`/api/orders?telegram_id=${tid}`, {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ urgent, deadline, items })
         });
-
-        tg.showAlert('✅ Создано');
+        tg.showAlert('✅ Заявка создана');
         window.location.href = '/';
-      } catch (err) {
+      }catch(err){
         tg.showAlert(err.message);
       }
-    });
+    };
 
-  } catch {
-    elNot.classList.remove('hidden');
+  }catch{
+    elNo.classList.remove('hidden');
   }
 }
 
