@@ -1,0 +1,11 @@
+body { font-family: Arial, sans-serif; background:#f5f7fb; margin:0; padding:16px; }
+.wrap { max-width:520px; margin:0 auto; }
+.card { background:#fff; border-radius:12px; padding:16px; box-shadow:0 2px 8px rgba(0,0,0,.08); margin-bottom:12px; }
+.hidden { display:none; }
+input, button { width:100%; padding:10px; margin:8px 0; border-radius:8px; border:1px solid #ccc; }
+button { background:#2cab37; color:#fff; border:none; cursor:pointer; font-weight:700; cursor:pointer; }
+.item { border-left:4px solid #2cab37; padding:10px 12px; background:#fff; border-radius:10px; margin:10px 0; }
+.badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:700; }
+.new { background:#ecf0f1; }
+.in_progress { background:#bde0fe; }
+.completed { background:#e8f6f3; color:#1e7e34; }
