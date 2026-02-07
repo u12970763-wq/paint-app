@@ -7,25 +7,19 @@ const sqlite3 = require('sqlite3').verbose();
 const TelegramBot = require('node-telegram-bot-api');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const PUBLIC_URL = process.env.PUBLIC_URL; // https://paint-app-1.onrender.com
+const PUBLIC_URL = process.env.PUBLIC_URL;
 
-if (!BOT_TOKEN) {
-  console.error('❌ BOT_TOKEN is missing');
-  process.exit(1);
-}
-if (!PUBLIC_URL || !PUBLIC_URL.startsWith('https://')) {
-  console.error('❌ PUBLIC_URL is missing or not https');
-  process.exit(1);
-}
+if (!BOT_TOKEN) { console.error('❌ BOT_TOKEN missing'); process.exit(1); }
+if (!PUBLIC_URL || !PUBLIC_URL.startsWith('https://')) { console.error('❌ PUBLIC_URL missing/invalid'); process.exit(1); }
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ----- DB -----
 const db = new sqlite3.Database(path.join(__dirname, 'data.db'));
 
+// ---- DB init + soft migrations ----
 db.serialize(() => {
   db.run(`
     CREATE TABLE IF NOT EXISTS users (
@@ -39,14 +33,14 @@ db.serialize(() => {
   db.run(`
     CREATE TABLE IF NOT EXISTS orders (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      manager_tid TEXT NOT NULL, -- кто создал (manager или director)
-      product TEXT NOT NULL,
-      color TEXT NOT NULL,
-      quantity REAL NOT NULL,
-      deadline TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      manager_tid TEXT NOT NULL,
 
-      status TEXT NOT NULL DEFAULT 'new', -- new | in_progress | completed | archived | canceled
+      items_json TEXT NOT NULL,      -- JSON array [{product,color,quantity}]
+      urgent INTEGER DEFAULT 0,      -- 1 срочно
+
+      deadline TEXT,
+      status TEXT NOT NULL DEFAULT 'new',  -- new | in_progress | completed | archived | canceled
       worker_tid TEXT,
 
       completed_at TEXT,
@@ -56,163 +50,87 @@ db.serialize(() => {
     )
   `);
 
-  // мягкая миграция (не ломает если колонка уже есть)
+  db.run(`
+    CREATE TABLE IF NOT EXISTS order_notifications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      order_id INTEGER NOT NULL,
+      worker_tid TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      message_id INTEGER NOT NULL,
+      type TEXT NOT NULL, -- 'new' | 'in_progress'
+      created_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
+
+  // soft migrations if you had old schema
   const alter = (sql) => db.run(sql, () => {});
-  alter(`ALTER TABLE orders ADD COLUMN completed_at TEXT`);
-  alter(`ALTER TABLE orders ADD COLUMN archived_at TEXT`);
-  alter(`ALTER TABLE orders ADD COLUMN canceled_at TEXT`);
-  alter(`ALTER TABLE orders ADD COLUMN cancel_reason TEXT`);
+  alter(`ALTER TABLE orders ADD COLUMN items_json TEXT`);
+  alter(`ALTER TABLE orders ADD COLUMN urgent INTEGER DEFAULT 0`);
+  alter(`ALTER TABLE order_notifications ADD COLUMN type TEXT`);
 });
 
-// ----- Telegram Bot (WEBHOOK) -----
+// ---- Telegram Bot (WEBHOOK) ----
 const bot = new TelegramBot(BOT_TOKEN);
 const WEBHOOK_PATH = '/telegram-webhook';
 
-app.post(WEBHOOK_PATH, (req, res) => {
-  bot.processUpdate(req.body);
-  res.sendStatus(200);
-});
+app.post(WEBHOOK_PATH, (req, res) => { bot.processUpdate(req.body); res.sendStatus(200); });
 
-// ----- Helpers -----
-function nowIso() {
-  return new Date().toISOString();
+// ---- Helpers ----
+const ARCHIVE_AFTER_HOURS = 12;
+const ARCHIVE_KEEP_DAYS = 30;
+
+function nowIso() { return new Date().toISOString(); }
+function hoursDiff(a, b) { return (new Date(b).getTime() - new Date(a).getTime()) / 36e5; }
+function daysDiff(a, b) { return (new Date(b).getTime() - new Date(a).getTime()) / (36e5 * 24); }
+
+function safeJsonParse(s, fallback) {
+  try { return JSON.parse(s); } catch { return fallback; }
 }
 
-function hoursBetween(isoA, isoB) {
-  const a = new Date(isoA).getTime();
-  const b = new Date(isoB).getTime();
-  return (b - a) / (1000 * 60 * 60);
-}
-
-function upsertUser(telegramId, role, name) {
+function upsertUser(tid, role, name) {
   return new Promise((resolve, reject) => {
     db.run(
       `INSERT INTO users (telegram_id, role, name)
        VALUES (?, ?, ?)
        ON CONFLICT(telegram_id) DO UPDATE SET role=excluded.role, name=excluded.name`,
-      [telegramId.toString(), role, name || ''],
+      [tid.toString(), role, name || ''],
       (err) => (err ? reject(err) : resolve())
     );
   });
 }
 
-function getUser(telegramId) {
+function getUser(tid) {
   return new Promise((resolve, reject) => {
-    db.get(`SELECT * FROM users WHERE telegram_id=?`, [telegramId.toString()], (err, row) => {
-      if (err) reject(err);
-      else resolve(row);
-    });
+    db.get(`SELECT * FROM users WHERE telegram_id=?`, [tid.toString()], (err, row) => err ? reject(err) : resolve(row));
+  });
+}
+
+function getUserName(tid) {
+  return new Promise((resolve) => {
+    db.get(`SELECT name FROM users WHERE telegram_id=?`, [tid?.toString() || ''], (err, row) => resolve(row?.name || null));
   });
 }
 
 function getWorkers() {
   return new Promise((resolve, reject) => {
-    db.all(`SELECT telegram_id, name FROM users WHERE role='worker'`, [], (err, rows) => {
-      if (err) reject(err);
-      else resolve(rows);
-    });
+    db.all(`SELECT telegram_id, name FROM users WHERE role='worker'`, [], (err, rows) => err ? reject(err) : resolve(rows));
   });
 }
 
-function getUserNameByTid(tid) {
-  return new Promise((resolve) => {
-    db.get(`SELECT name FROM users WHERE telegram_id=?`, [tid?.toString() || ''], (err, row) => {
-      resolve(row?.name || null);
-    });
-  });
-}
-
-function getOrderById(id) {
+function getOrder(id) {
   return new Promise((resolve, reject) => {
-    db.get(`SELECT * FROM orders WHERE id=?`, [id], (err, row) => {
-      if (err) reject(err);
-      else resolve(row);
-    });
+    db.get(`SELECT * FROM orders WHERE id=?`, [id], (err, row) => err ? reject(err) : resolve(row));
   });
 }
 
 async function enrichOrder(o) {
   return {
     ...o,
-    worker_name: o.worker_tid ? await getUserNameByTid(o.worker_tid) : null
+    items: safeJsonParse(o.items_json, []),
+    worker_name: o.worker_tid ? await getUserName(o.worker_tid) : null
   };
 }
 
-function listOrdersForManager(managerTid, status, limit = 200) {
-  return new Promise((resolve, reject) => {
-    const params = [managerTid.toString()];
-    let where = `manager_tid=?`;
-
-    if (status && status !== 'all') {
-      where += ` AND status=?`;
-      params.push(status);
-    }
-
-    db.all(
-      `SELECT * FROM orders
-       WHERE ${where}
-       ORDER BY datetime(created_at) DESC
-       LIMIT ${Number(limit)}`,
-      params,
-      async (err, rows) => {
-        if (err) return reject(err);
-        const out = [];
-        for (const r of rows) out.push(await enrichOrder(r));
-        resolve(out);
-      }
-    );
-  });
-}
-
-function listOrdersForWorker(scopeTid, scope, status, limit = 50) {
-  return new Promise((resolve, reject) => {
-    const params = [];
-    let where = `1=1`;
-
-    if (scope === 'mine') {
-      where += ` AND worker_tid=?`;
-      params.push(scopeTid.toString());
-    }
-
-    if (status && status !== 'all') {
-      where += ` AND status=?`;
-      params.push(status);
-    }
-
-    db.all(
-      `SELECT * FROM orders
-       WHERE ${where}
-       ORDER BY datetime(created_at) DESC
-       LIMIT ${Number(limit)}`,
-      params,
-      async (err, rows) => {
-        if (err) return reject(err);
-        const out = [];
-        for (const r of rows) out.push(await enrichOrder(r));
-        resolve(out);
-      }
-    );
-  });
-}
-
-// ----- Auto-archive (every 10 min) -----
-async function autoArchiveCompleted() {
-  db.all(`SELECT id, completed_at FROM orders WHERE status='completed' AND completed_at IS NOT NULL`, [], (err, rows) => {
-    if (err) return;
-    const now = nowIso();
-    rows.forEach((r) => {
-      if (hoursBetween(r.completed_at, now) >= 12) {
-        db.run(
-          `UPDATE orders SET status='archived', archived_at=? WHERE id=? AND status='completed'`,
-          [nowIso(), r.id]
-        );
-      }
-    });
-  });
-}
-setInterval(autoArchiveCompleted, 10 * 60 * 1000);
-
-// ----- Bot Menus -----
 function roleKeyboard() {
   return {
     reply_markup: {
@@ -227,14 +145,105 @@ function workerMenu() {
   return {
     reply_markup: {
       keyboard: [
-        [{ text: '📋 Все заявки' }, { text: '🧰 Мои заявки' }],
-        [{ text: '🗂 Архив' }]
+        [{ text: '🔥 Срочно' }, { text: '📋 Новые' }],
+        [{ text: '🧰 Мои' }, { text: '✅ Готово' }]
       ],
       resize_keyboard: true
     }
   };
 }
 
+function statusRu(s) {
+  return ({ new:'Новые', in_progress:'В работе', completed:'Готово', archived:'Архив', canceled:'Отменено' })[s] || s;
+}
+
+function orderText(o) {
+  const urgent = o.urgent ? '🔥 СРОЧНО\n' : '';
+  const items = (o.items || []).map((it, idx) => `• ${it.product} | ${it.color} | ${it.quantity} л`).join('\n');
+  const deadline = o.deadline ? `\n⏱ Срок: ${new Date(o.deadline).toLocaleString()}` : '';
+  const worker = o.worker_name ? `\n👷 Рабочий: ${o.worker_name}` : (o.worker_tid ? `\n👷 Рабочий: ${o.worker_tid}` : '');
+  return `${urgent}#${o.id} — ${statusRu(o.status)}${deadline}${worker}\n${items}`;
+}
+
+function workerButtons(o, myTid) {
+  const kb = [];
+  if (o.status === 'new') kb.push([{ text: '✅ Принять в работу', callback_data: `take:${o.id}` }]);
+  if (o.status === 'in_progress' && o.worker_tid === myTid) kb.push([{ text: '🏁 Готово', callback_data: `complete:${o.id}` }]);
+  return kb.length ? { reply_markup: { inline_keyboard: kb } } : {};
+}
+
+async function deleteSafe(chatId, messageId) {
+  try { await bot.deleteMessage(chatId, messageId); } catch {}
+}
+
+// ---- Notifications table helpers ----
+function saveNotification({ order_id, worker_tid, chat_id, message_id, type }) {
+  return new Promise((resolve) => {
+    db.run(
+      `INSERT INTO order_notifications (order_id, worker_tid, chat_id, message_id, type) VALUES (?, ?, ?, ?, ?)`,
+      [order_id, worker_tid.toString(), chat_id.toString(), Number(message_id), type],
+      () => resolve()
+    );
+  });
+}
+
+function getNotifications(orderId, type = null) {
+  return new Promise((resolve, reject) => {
+    const params = [Number(orderId)];
+    let where = `order_id=?`;
+    if (type) { where += ` AND type=?`; params.push(type); }
+
+    db.all(`SELECT * FROM order_notifications WHERE ${where}`, params, (err, rows) => err ? reject(err) : resolve(rows));
+  });
+}
+
+function clearNotifications(orderId, type = null) {
+  return new Promise((resolve) => {
+    const params = [Number(orderId)];
+    let where = `order_id=?`;
+    if (type) { where += ` AND type=?`; params.push(type); }
+    db.run(`DELETE FROM order_notifications WHERE ${where}`, params, () => resolve());
+  });
+}
+
+// ---- Scheduled jobs ----
+
+// completed -> archived after 12h
+function autoArchiveJob() {
+  db.all(`SELECT id, completed_at FROM orders WHERE status='completed' AND completed_at IS NOT NULL`, [], (err, rows) => {
+    if (err) return;
+    const now = nowIso();
+    rows.forEach(r => {
+      if (hoursDiff(r.completed_at, now) >= ARCHIVE_AFTER_HOURS) {
+        db.run(`UPDATE orders SET status='archived', archived_at=? WHERE id=? AND status='completed'`, [nowIso(), r.id]);
+      }
+    });
+  });
+}
+setInterval(autoArchiveJob, 10 * 60 * 1000);
+
+// delete archived older than 30 days (once per day)
+function cleanupJob() {
+  db.all(`SELECT id, archived_at FROM orders WHERE status='archived' AND archived_at IS NOT NULL`, [], (err, rows) => {
+    if (err) return;
+    const now = nowIso();
+    rows.forEach(r => {
+      if (daysDiff(r.archived_at, now) >= ARCHIVE_KEEP_DAYS) {
+        db.run(`DELETE FROM orders WHERE id=?`, [r.id]);
+        db.run(`DELETE FROM order_notifications WHERE order_id=?`, [r.id]);
+      }
+    });
+  });
+
+  // also cleanup orphan notifications older than 7 days
+  db.run(`
+    DELETE FROM order_notifications
+    WHERE created_at < datetime('now', '-7 days')
+  `);
+}
+setInterval(cleanupJob, 24 * 60 * 60 * 1000);
+
+// ---- BOT commands ----
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(msg.chat.id, 'Выберите роль:', roleKeyboard());
 });
@@ -246,21 +255,15 @@ bot.on('message', async (msg) => {
 
   if (text === '🛒 Manager') {
     await upsertUser(tid, 'manager', msg.from.first_name);
-    return bot.sendMessage(msg.chat.id, '✅ Вы Manager. Открыть панель "Заявки":', {
-      reply_markup: {
-        remove_keyboard: true,
-        inline_keyboard: [[{ text: '📱 Открыть "Заявки"', web_app: { url: PUBLIC_URL } }]]
-      }
+    return bot.sendMessage(msg.chat.id, '✅ Вы Manager. Открыть "Заявки":', {
+      reply_markup: { remove_keyboard: true, inline_keyboard: [[{ text: '📱 Открыть "Заявки"', web_app: { url: PUBLIC_URL } }]] }
     });
   }
 
   if (text === '👔 Director') {
     await upsertUser(tid, 'director', msg.from.first_name);
-    return bot.sendMessage(msg.chat.id, '✅ Вы Director. Открыть панель "Заявки":', {
-      reply_markup: {
-        remove_keyboard: true,
-        inline_keyboard: [[{ text: '📱 Открыть "Заявки"', web_app: { url: PUBLIC_URL } }]]
-      }
+    return bot.sendMessage(msg.chat.id, '✅ Вы Director. Открыть "Заявки":', {
+      reply_markup: { remove_keyboard: true, inline_keyboard: [[{ text: '📱 Открыть "Заявки"', web_app: { url: PUBLIC_URL } }]] }
     });
   }
 
@@ -269,91 +272,112 @@ bot.on('message', async (msg) => {
     return bot.sendMessage(msg.chat.id, '✅ Вы Worker. Меню:', workerMenu());
   }
 
-  // Worker menu
+  // Worker menu (only актуальные + готово)
   const user = await getUser(tid).catch(() => null);
   if (user?.role === 'worker') {
-    if (text === '📋 Все заявки') {
-      const orders = await listOrdersForWorker(tid, 'all', 'all', 10);
-      if (!orders.length) return bot.sendMessage(msg.chat.id, 'Нет заявок.', workerMenu());
-      for (const o of orders) await bot.sendMessage(msg.chat.id, formatOrderForWorker(o), workerOrderKeyboard(o, tid));
+    if (text === '🔥 Срочно') {
+      const orders = await listWorkerUrgentNewAndMine(tid, 15);
+      if (!orders.length) return bot.sendMessage(msg.chat.id, 'Нет срочных актуальных заявок.', workerMenu());
+      for (const o of orders) await bot.sendMessage(msg.chat.id, orderText(o), workerButtons(o, tid));
       return;
     }
 
-    if (text === '🧰 Мои заявки') {
-      const orders = await listOrdersForWorker(tid, 'mine', 'all', 10);
-      if (!orders.length) return bot.sendMessage(msg.chat.id, 'У вас нет заявок.', workerMenu());
-      for (const o of orders) await bot.sendMessage(msg.chat.id, formatOrderForWorker(o), workerOrderKeyboard(o, tid));
+    if (text === '📋 Новые') {
+      const orders = await listWorkerNew(tid, 15);
+      if (!orders.length) return bot.sendMessage(msg.chat.id, 'Нет новых заявок.', workerMenu());
+      for (const o of orders) await bot.sendMessage(msg.chat.id, orderText(o), workerButtons(o, tid));
       return;
     }
 
-    if (text === '🗂 Архив') {
-      const orders = await listOrdersForWorker(tid, 'all', 'archived', 10);
-      if (!orders.length) return bot.sendMessage(msg.chat.id, 'Архив пуст.', workerMenu());
-      for (const o of orders) await bot.sendMessage(msg.chat.id, formatOrderForWorker(o), workerOrderKeyboard(o, tid));
+    if (text === '🧰 Мои') {
+      const orders = await listWorkerMineInProgress(tid, 15);
+      if (!orders.length) return bot.sendMessage(msg.chat.id, 'У вас нет заявок в работе.', workerMenu());
+      for (const o of orders) await bot.sendMessage(msg.chat.id, orderText(o), workerButtons(o, tid));
+      return;
+    }
+
+    if (text === '✅ Готово') {
+      const orders = await listWorkerMineCompleted(tid, 15);
+      if (!orders.length) return bot.sendMessage(msg.chat.id, 'У вас нет готовых заявок.', workerMenu());
+      for (const o of orders) await bot.sendMessage(msg.chat.id, orderText(o));
       return;
     }
   }
 });
 
-bot.onText(/\/open/, (msg) => {
-  bot.sendMessage(msg.chat.id, 'Открыть панель "Заявки":', {
-    reply_markup: { inline_keyboard: [[{ text: '📱 Открыть', web_app: { url: PUBLIC_URL } }]] }
+// Worker lists with required filtering
+function listOrders(where, params) {
+  return new Promise((resolve, reject) => {
+    db.all(
+      `SELECT * FROM orders WHERE ${where} ORDER BY urgent DESC, datetime(created_at) DESC LIMIT 200`,
+      params,
+      async (err, rows) => {
+        if (err) return reject(err);
+        const out = [];
+        for (const r of rows) out.push(await enrichOrder(r));
+        resolve(out);
+      }
+    );
   });
-});
-
-// ----- Formatting & keyboards -----
-function statusRu(s) {
-  return ({
-    new: 'Новые',
-    in_progress: 'В работе',
-    completed: 'Готово',
-    archived: 'Архив',
-    canceled: 'Отменено'
-  })[s] || s;
 }
 
-function formatOrderForWorker(o) {
-  const deadline = o.deadline ? `\n⏱ Срок: ${new Date(o.deadline).toLocaleString()}` : '';
-  const worker = o.worker_name ? `\n👷 Рабочий: ${o.worker_name}` : (o.worker_tid ? `\n👷 Рабочий: ${o.worker_tid}` : '');
-  return `#${o.id} — ${statusRu(o.status)}
-🧾 Продукт: ${o.product}
-🎨 Цвет: ${o.color}
-📦 Кол-во: ${o.quantity} л${deadline}${worker}`;
+async function listWorkerNew(tid, limit = 15) {
+  const rows = await listOrders(`status='new'`, []);
+  return rows.slice(0, limit);
+}
+async function listWorkerMineInProgress(tid, limit = 15) {
+  const rows = await listOrders(`status='in_progress' AND worker_tid=?`, [tid.toString()]);
+  return rows.slice(0, limit);
+}
+async function listWorkerMineCompleted(tid, limit = 15) {
+  const rows = await listOrders(`status='completed' AND worker_tid=?`, [tid.toString()]);
+  return rows.slice(0, limit);
+}
+async function listWorkerUrgentNewAndMine(tid, limit = 15) {
+  const rows = await listOrders(
+    `(urgent=1) AND ((status='new') OR (status='in_progress' AND worker_tid=?))`,
+    [tid.toString()]
+  );
+  return rows.slice(0, limit);
 }
 
-function workerOrderKeyboard(o, myTid) {
-  const buttons = [];
-  if (o.status === 'new') buttons.push([{ text: '✅ Взять', callback_data: `take:${o.id}` }]);
-  if (o.status === 'in_progress' && o.worker_tid === myTid) buttons.push([{ text: '🏁 Готово', callback_data: `complete:${o.id}` }]);
-  if (o.status === 'completed') buttons.push([{ text: '🗂 В архив', callback_data: `archive:${o.id}` }]);
-  return buttons.length ? { reply_markup: { inline_keyboard: buttons } } : {};
-}
-
-// ----- Callbacks -----
+// ---- Callback buttons ----
 bot.on('callback_query', async (q) => {
   const tid = q.from.id.toString();
   const [action, idStr] = (q.data || '').split(':');
   const orderId = Number(idStr);
-
   await bot.answerCallbackQuery(q.id);
   if (!orderId) return;
 
   if (action === 'take') {
     const user = await getUser(tid).catch(() => null);
-    if (user?.role !== 'worker') return bot.sendMessage(tid, 'Только Worker может брать заявки.');
+    if (user?.role !== 'worker') return;
 
+    // try take atomically
     db.run(
       `UPDATE orders SET status='in_progress', worker_tid=? WHERE id=? AND status='new'`,
       [tid, orderId],
       async function (err) {
-        if (err) return bot.sendMessage(tid, '❌ Ошибка БД');
-        if (this.changes === 0) return bot.sendMessage(tid, `❌ Нельзя взять #${orderId}`);
+        if (err || this.changes === 0) {
+          // someone else took it -> delete this message for current worker
+          await deleteSafe(q.message.chat.id, q.message.message_id);
+          return;
+        }
 
-        const o = await enrichOrder(await getOrderById(orderId));
-        await bot.editMessageText(formatOrderForWorker(o), {
-          chat_id: q.message.chat.id,
-          message_id: q.message.message_id,
-          ...workerOrderKeyboard(o, tid)
+        // delete "new order" messages for all workers (including current one)
+        const notes = await getNotifications(orderId, 'new').catch(() => []);
+        for (const n of notes) await deleteSafe(n.chat_id, n.message_id);
+        await clearNotifications(orderId, 'new');
+
+        // send new "in_progress" message only to taker, store it so we can delete on complete
+        const order = await enrichOrder(await getOrder(orderId));
+        const sent = await bot.sendMessage(q.message.chat.id, orderText(order), workerButtons(order, tid));
+        await saveNotification({
+          order_id: orderId,
+          worker_tid: tid,
+          chat_id: q.message.chat.id.toString(),
+          message_id: sent.message_id,
+          type: 'in_progress'
         });
       }
     );
@@ -361,179 +385,129 @@ bot.on('callback_query', async (q) => {
 
   if (action === 'complete') {
     const user = await getUser(tid).catch(() => null);
-    if (user?.role !== 'worker') return bot.sendMessage(tid, 'Только Worker.');
+    if (user?.role !== 'worker') return;
 
     db.run(
       `UPDATE orders SET status='completed', completed_at=? 
        WHERE id=? AND worker_tid=? AND status='in_progress'`,
       [nowIso(), orderId, tid],
       async function (err) {
-        if (err) return bot.sendMessage(tid, '❌ Ошибка БД');
-        if (this.changes === 0) return bot.sendMessage(tid, `❌ Нельзя завершить #${orderId}`);
+        if (err || this.changes === 0) return;
 
-        const order = await enrichOrder(await getOrderById(orderId));
-        await bot.editMessageText(formatOrderForWorker(order), {
-          chat_id: q.message.chat.id,
-          message_id: q.message.message_id,
-          ...workerOrderKeyboard(order, tid)
-        });
+        // delete worker "in_progress" message(s)
+        const notes = await getNotifications(orderId, 'in_progress').catch(() => []);
+        for (const n of notes) {
+          if (n.worker_tid === tid) await deleteSafe(n.chat_id, n.message_id);
+        }
+        await clearNotifications(orderId, 'in_progress');
 
-        // Уведомление создателю (manager/director) — ТОЛЬКО ему
+        // notify creator (manager/director) only
+        const order = await enrichOrder(await getOrder(orderId));
         const workerName = order.worker_name || tid;
         await bot.sendMessage(
           order.manager_tid,
-          `✅ Заявка #${orderId} готова!\nРабочий: ${workerName}\nПродукт: ${order.product}\nЦвет: ${order.color}\nКоличество: ${order.quantity} л`
+          `✅ Заявка #${orderId} готова!\nРабочий: ${workerName}\n${orderText(order)}`
         );
-      }
-    );
-  }
-
-  if (action === 'archive') {
-    // менеджер/директор и рабочий могут архивировать completed
-    db.run(
-      `UPDATE orders SET status='archived', archived_at=? WHERE id=? AND status='completed'`,
-      [nowIso(), orderId],
-      async function (err) {
-        if (err) return bot.sendMessage(tid, '❌ Ошибка БД');
-        if (this.changes === 0) return bot.sendMessage(tid, `❌ Нельзя архивировать #${orderId}`);
-
-        const o = await enrichOrder(await getOrderById(orderId));
-        await bot.editMessageText(formatOrderForWorker(o), {
-          chat_id: q.message.chat.id,
-          message_id: q.message.message_id
-        });
       }
     );
   }
 });
 
-// ----- API permissions: manager or director -----
+// ---- API permissions ----
 function requireManagerOrDirector(req, res, next) {
   const tid = (req.query.telegram_id || req.body.telegram_id || '').toString();
   if (!tid) return res.status(400).json({ error: 'telegram_id required' });
 
   db.get(`SELECT role FROM users WHERE telegram_id=?`, [tid], (err, row) => {
     if (err) return res.status(500).json({ error: err.message });
-    if (!row || !['manager', 'director'].includes(row.role)) {
-      return res.status(403).json({ error: 'only manager or director' });
-    }
+    if (!row || !['manager', 'director'].includes(row.role)) return res.status(403).json({ error: 'only manager/director' });
     req.manager_tid = tid;
     next();
   });
 }
 
-app.get('/api/me', (req, res) => {
-  const telegram_id = req.query.telegram_id?.toString();
-  if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
-
-  db.get(`SELECT role, name FROM users WHERE telegram_id=?`, [telegram_id], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!row) return res.status(404).json({ error: 'not registered' });
-    res.json(row);
-  });
+// ---- API: me ----
+app.get('/api/me', async (req, res) => {
+  const tid = (req.query.telegram_id || '').toString();
+  if (!tid) return res.status(400).json({ error: 'telegram_id required' });
+  const u = await getUser(tid).catch(() => null);
+  if (!u) return res.status(404).json({ error: 'not registered' });
+  res.json({ role: u.role, name: u.name });
 });
 
-// manager/director: list orders by status (only own created orders)
+// ---- API: manager/director list orders ----
 app.get('/api/orders', requireManagerOrDirector, async (req, res) => {
-  const status = (req.query.status || 'all').toString();
-  const orders = await listOrdersForManager(req.manager_tid, status, 200).catch(() => null);
-  if (!orders) return res.status(500).json({ error: 'db error' });
-  res.json(orders);
+  const status = (req.query.status || 'new').toString();
+  const urgent = (req.query.urgent || '0').toString() === '1';
+
+  const whereParts = [`manager_tid=?`];
+  const params = [req.manager_tid];
+
+  // status filter
+  if (status !== 'all') {
+    whereParts.push(`status=?`);
+    params.push(status);
+  } else {
+    // all means except canceled (since you removed canceled tab)
+    whereParts.push(`status != 'canceled'`);
+  }
+
+  if (urgent) {
+    whereParts.push(`urgent=1`);
+    // urgent list should be only актуальные: exclude archived
+    whereParts.push(`status != 'archived'`);
+    whereParts.push(`status != 'canceled'`);
+  }
+
+  const where = whereParts.join(' AND ');
+  db.all(
+    `SELECT * FROM orders WHERE ${where} ORDER BY urgent DESC, datetime(created_at) DESC LIMIT 500`,
+    params,
+    async (err, rows) => {
+      if (err) return res.status(500).json({ error: err.message });
+      const out = [];
+      for (const r of rows) out.push(await enrichOrder(r));
+      res.json(out);
+    }
+  );
 });
 
-// manager/director: create order
-app.post('/api/orders', requireManagerOrDirector, (req, res) => {
-  const { product, color, quantity, deadline } = req.body || {};
-  if (!product || !color || !quantity) return res.status(400).json({ error: 'product, color, quantity required' });
+// ---- API: create order (items unlimited + urgent) ----
+app.post('/api/orders', requireManagerOrDirector, async (req, res) => {
+  const urgent = req.body?.urgent ? 1 : 0;
+  const deadline = req.body?.deadline || null;
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+
+  const cleanItems = items
+    .map(it => ({
+      product: (it.product || '').toString().trim(),
+      color: (it.color || '').toString().trim(),
+      quantity: Number(it.quantity)
+    }))
+    .filter(it => it.product && it.color && Number.isFinite(it.quantity) && it.quantity > 0);
+
+  if (!cleanItems.length) return res.status(400).json({ error: 'items required' });
+
+  const items_json = JSON.stringify(cleanItems);
 
   db.run(
-    `INSERT INTO orders (manager_tid, product, color, quantity, deadline) VALUES (?, ?, ?, ?, ?)`,
-    [req.manager_tid, product, color, Number(quantity), deadline || null],
+    `INSERT INTO orders (manager_tid, items_json, urgent, deadline) VALUES (?, ?, ?, ?)`,
+    [req.manager_tid, items_json, urgent, deadline],
     async function (err) {
       if (err) return res.status(500).json({ error: err.message });
 
       const orderId = this.lastID;
+      const order = await enrichOrder(await getOrder(orderId));
+
+      // notify all workers about NEW order and store message_id for deletion
       const workers = await getWorkers();
-
       for (const w of workers) {
-        await bot.sendMessage(
+        const sent = await bot.sendMessage(
           w.telegram_id,
-          `🔔 Новый заказ #${orderId}\nПродукт: ${product}\nЦвет: ${color}\nКол-во: ${quantity} л`,
-          { reply_markup: { inline_keyboard: [[{ text: '✅ Взять', callback_data: `take:${orderId}` }]] } }
+          orderText(order),
+          { reply_markup: { inline_keyboard: [[{ text: '✅ Принять в работу', callback_data: `take:${orderId}` }]] } }
         );
-      }
-
-      res.json({ success: true, id: orderId });
-    }
-  );
-});
-
-app.post('/api/orders/:id/archive', requireManagerOrDirector, (req, res) => {
-  const id = Number(req.params.id);
-  db.run(
-    `UPDATE orders SET status='archived', archived_at=? WHERE id=? AND status='completed' AND manager_tid=?`,
-    [nowIso(), id, req.manager_tid],
-    function (err) {
-      if (err) return res.status(500).json({ error: err.message });
-      if (this.changes === 0) return res.status(400).json({ error: 'cannot archive' });
-      res.json({ success: true });
-    }
-  );
-});
-
-app.post('/api/orders/:id/unarchive', requireManagerOrDirector, (req, res) => {
-  const id = Number(req.params.id);
-  db.run(
-    `UPDATE orders SET status='completed', archived_at=NULL WHERE id=? AND status='archived' AND manager_tid=?`,
-    [id, req.manager_tid],
-    function (err) {
-      if (err) return res.status(500).json({ error: err.message });
-      if (this.changes === 0) return res.status(400).json({ error: 'cannot unarchive' });
-      res.json({ success: true });
-    }
-  );
-});
-
-app.post('/api/orders/:id/cancel', requireManagerOrDirector, (req, res) => {
-  const id = Number(req.params.id);
-  const reason = (req.body.reason || '').toString().slice(0, 500);
-
-  db.run(
-    `UPDATE orders SET status='canceled', canceled_at=?, cancel_reason=?
-     WHERE id=? AND manager_tid=? AND status != 'canceled'`,
-    [nowIso(), reason, id, req.manager_tid],
-    function (err) {
-      if (err) return res.status(500).json({ error: err.message });
-      if (this.changes === 0) return res.status(400).json({ error: 'cannot cancel' });
-      res.json({ success: true });
-    }
-  );
-});
-
-// worker: view orders (all/mine, with status filter)
-app.get('/api/worker/orders', async (req, res) => {
-  const tid = (req.query.telegram_id || '').toString();
-  const scope = (req.query.scope || 'all').toString();
-  const status = (req.query.status || 'all').toString();
-
-  const user = await getUser(tid).catch(() => null);
-  if (!user || user.role !== 'worker') return res.status(403).json({ error: 'only worker' });
-
-  const orders = await listOrdersForWorker(tid, scope, status, 200).catch(() => null);
-  if (!orders) return res.status(500).json({ error: 'db error' });
-  res.json(orders);
-});
-
-// ---- start server + set webhook ----
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, async () => {
-  console.log(`✅ Server listening on port ${PORT}`);
-  const webhookUrl = `${PUBLIC_URL}${WEBHOOK_PATH}`;
-  try {
-    await bot.setWebHook(webhookUrl);
-    console.log('✅ Webhook set to:', webhookUrl);
-  } catch (e) {
-    console.error('❌ setWebHook error:', e.message);
-  }
-});
+        await saveNotification({
+          order_id: orderId,
+          worker_tid: w.telegram_id,
+          chat_id: w.telegram_id, // in private chat chat_id 
